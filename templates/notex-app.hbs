@@ -1,0 +1,107 @@
+<div class="notex-layout">
+
+  {{!-- Zona esquerda: notas rápidas (rascunho, texto puro, auto-save) --}}
+  <section class="notex-scratch-zone">
+    <header class="notex-zone-header">
+      <span><i class="fas fa-bolt"></i> {{localize "NOTEX.Scratch"}}</span>
+    </header>
+    <textarea class="notex-scratch"
+              placeholder="{{localize "NOTEX.ScratchPlaceholder"}}">{{scratch}}</textarea>
+  </section>
+
+  {{!-- Splitter único entre as duas zonas --}}
+  <div class="notex-splitter" data-target="scratch"></div>
+
+  {{!-- Zona direita: notas normais (lista em cima do editor) --}}
+  <section class="notex-notes-zone">
+    <aside class="notex-sidebar">
+      <header class="notex-zone-header">
+        <span><i class="fas fa-folder-open"></i> {{localize "NOTEX.Notes"}}</span>
+        <span class="notex-header-actions">
+          <a class="notex-create-folder" data-action="createFolder"
+             data-tooltip="{{localize "NOTEX.NewFolder"}}"><i class="fas fa-folder-plus"></i></a>
+          <a class="notex-create" data-action="createNote"
+             data-tooltip="{{localize "NOTEX.NewNote"}}"><i class="fas fa-plus"></i></a>
+        </span>
+      </header>
+
+      <div class="notex-search">
+        <i class="fas fa-magnifying-glass notex-search-icon"></i>
+        <input type="text" class="notex-search-input"
+               placeholder="{{localize "NOTEX.SearchPlaceholder"}}"
+               value="{{searchTerm}}">
+        {{#if isSearching}}
+          <a class="notex-search-clear" data-tooltip="{{localize "NOTEX.SearchClear"}}">
+            <i class="fas fa-xmark"></i>
+          </a>
+        {{/if}}
+      </div>
+
+      <div class="notex-list">
+        {{#if isSearching}}
+          {{#each flat}}
+            {{> notexNote}}
+          {{else}}
+            <p class="notex-empty">{{localize "NOTEX.NoResults"}}</p>
+          {{/each}}
+        {{else}}
+          {{#if hasPinned}}
+            <div class="notex-pinned-group">
+              <div class="notex-group-label"><i class="fas fa-thumbtack"></i> {{localize "NOTEX.Pinned"}}</div>
+              {{#each pinned}}{{> notexNote}}{{/each}}
+            </div>
+          {{/if}}
+
+          <div class="notex-tree">
+            {{#each tree}}
+              {{#if (eq this.type "folder")}}{{> notexFolder}}{{else}}{{> notexNote}}{{/if}}
+            {{/each}}
+          </div>
+
+          {{#if isEmpty}}
+            <p class="notex-empty">{{localize "NOTEX.Empty"}}</p>
+          {{/if}}
+        {{/if}}
+      </div>
+    </aside>
+
+    {{!-- Splitter entre a lista de notas e o editor --}}
+    <div class="notex-splitter notex-splitter-inner" data-target="sidebar"></div>
+
+    <div class="notex-editor-pane">
+      {{#if hasActive}}
+        <div class="notex-pane-header">
+          {{#if editMode}}
+            <input type="text" class="notex-active-title" value="{{activeName}}"
+                   placeholder="{{localize "NOTEX.NewNoteName"}}">
+            <a class="notex-pane-btn notex-done" data-action="saveAndView">
+              <i class="fas fa-check"></i> {{localize "NOTEX.Done"}}
+            </a>
+          {{else}}
+            <span class="notex-view-title">{{activeName}}</span>
+            <a class="notex-pane-btn notex-edit" data-action="editNote">
+              <i class="fas fa-pen"></i> {{localize "NOTEX.Edit"}}
+            </a>
+          {{/if}}
+        </div>
+
+        {{#if editMode}}
+          <div class="notex-editor">
+            <div class="notex-editor-mount"></div>
+          </div>
+        {{else}}
+          <div class="notex-view">
+            {{#if activeEnriched}}
+              {{{activeEnriched}}}
+            {{else}}
+              <p class="notex-empty">{{localize "NOTEX.EmptyNote"}}</p>
+            {{/if}}
+          </div>
+        {{/if}}
+      {{else}}
+        <p class="notex-empty notex-editor-empty">{{localize "NOTEX.SelectHint"}}</p>
+      {{/if}}
+    </div>
+  </section>
+
+</div>

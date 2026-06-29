@@ -24,33 +24,98 @@ const NotexFolders = {
   },
 
   async ensureRoot() {
-    let root = game.folders.find(
-      (f) => f.type === "JournalEntry" && f.name === this.rootName && !f.folder
-    );
+    let root = this.findRoot();
     if (root) return root;
-    if (!game.user.isGM) return null;
+    if (!game.user.isGM) return null; // só o GM cria a raiz
     return Folder.create({ name: this.rootName, type: "JournalEntry", color: "#4b2e83" });
   },
 
-  async ensureUserFolder(user = game.user) {
-    const root = await this.ensureRoot();
-    if (!root) return null;
+  /** Encontra a pasta raiz Notex (sem criar). */
+  findRoot() {
+    return game.folders.find(
+      (f) => f.type === "JournalEntry" && f.name === this.rootName && !f.folder
+    ) ?? null;
+  },
 
-    let folder = game.folders.find(
+  /** Encontra a pasta de um usuário (sem criar). */
+  findUserFolder(user = game.user) {
+    const root = this.findRoot();
+    if (!root) return undefined;
+    return game.folders.find(
       (f) =>
         f.type === "JournalEntry" &&
-        f.folder?.id === root.id &&
-        f.getFlag(MODULE_ID, "userId") === user.id
+        f.getFlag?.(MODULE_ID, "userId") === user.id &&
+        f.folder?.id === root.id // DEVE ser filha direta da raiz Notex
     );
-    if (folder) return folder;
-    if (user.id !== game.user.id && !game.user.isGM) return null;
+  },
 
+  /**
+   * Retorna a pasta do usuário. Jogadores NÃO criam pastas (sem permissão);
+   * apenas leem a que o GM provisionou. O GM cria sob demanda se faltar.
+   */
+  async ensureUserFolder(user = game.user) {
+    const existing = this.findUserFolder(user);
+    if (existing) return existing;
+
+    // Apenas o GM pode criar pastas. Jogador retorna null e a UI avisa.
+    if (!game.user.isGM) return null;
+    return this._createUserFolder(user);
+  },
+
+  /** Cria a pasta de um usuário específico (somente GM). */
+  async _createUserFolder(user) {
+    const root = await this.ensureRoot();
+    if (!root) return null;
     return Folder.create({
       name: user.name,
       type: "JournalEntry",
       folder: root.id,
       ownership: { default: OWNERSHIP.NONE, [user.id]: OWNERSHIP.OWNER },
       flags: { [MODULE_ID]: { userId: user.id } }
+    });
+  },
+
+  /**
+   * Provisiona a pasta raiz + uma subpasta para cada jogador do mundo.
+   * Chamado quando o GM entra, e quando um usuário novo é criado.
+   * Só o GM executa (tem permissão de criar Folder).
+   */
+  async provisionAll() {
+    if (!game.user.isGM) return;
+    await this.ensureRoot();
+    for (const user of game.users) {
+      if (user.isGM) continue; // GM vê tudo, não precisa de pasta própria
+      if (!this.findUserFolder(user)) {
+        await this._createUserFolder(user);
+      }
+    }
+  },
+
+  /**
+   * Cria uma subpasta para um usuário específico (chamado pelo GM via socket,
+   * a pedido de um jogador). A pasta nasce com o jogador como dono. O parentId
+   * deve estar dentro da subárvore do jogador; senão, cai na pasta-raiz dele.
+   */
+  async createFolderFor(userId, name, parentId = null) {
+    if (!game.user.isGM) return null;
+    const user = game.users.get(userId);
+    if (!user) return null;
+
+    // Garante que o jogador tenha a pasta-raiz dele.
+    let userRoot = this.findUserFolder(user);
+    if (!userRoot) userRoot = await this._createUserFolder(user);
+    if (!userRoot) return null;
+
+    // Valida que o parent pedido pertence à subárvore do jogador.
+    let parent = parentId ? game.folders.get(parentId) : null;
+    if (parent && parent.getFlag(MODULE_ID, "userId") !== userId) parent = null;
+
+    return Folder.create({
+      name: name || game.i18n.localize("NOTEX.NewFolderName"),
+      type: "JournalEntry",
+      folder: parent?.id ?? userRoot.id,
+      ownership: { default: OWNERSHIP.NONE, [userId]: OWNERSHIP.OWNER },
+      flags: { [MODULE_ID]: { userId } }
     });
   },
 
@@ -69,6 +134,146 @@ const NotexFolders = {
       return entry;
     }
     return null;
+  }
+};
+
+/* -------------------------------------------- */
+/*  Socket: jogador pede, GM cria a pasta        */
+/* -------------------------------------------- */
+
+const SOCKET = `module.${MODULE_ID}`;
+
+const NotexSocket = {
+  /** Pedidos pendentes aguardando resposta do GM (requestId → {resolve}). */
+  _pending: new Map(),
+
+  /** Registra os listeners de socket (chamado no ready de todos). */
+  register() {
+    game.socket.on(SOCKET, (msg) => this._onMessage(msg));
+  },
+
+  async _onMessage(msg) {
+    if (!msg?.action) return;
+
+    // GM recebe pedido de criação e executa.
+    if (msg.action === "createFolder" && game.user.isGM) {
+      // Apenas o primeiro GM ativo responde (evita criação dupla com vários GMs).
+      const firstGM = game.users.find((u) => u.isGM && u.active);
+      if (firstGM?.id !== game.user.id) return;
+
+      let result = null;
+      try {
+        const folder = await NotexFolders.createFolderFor(
+          msg.userId,
+          msg.name,
+          msg.parentId
+        );
+        result = folder?.id ?? null;
+      } catch (e) {
+        console.error(`${MODULE_ID} | falha ao criar pasta para jogador:`, e);
+      }
+      game.socket.emit(SOCKET, {
+        action: "createFolderResult",
+        requestId: msg.requestId,
+        toUser: msg.userId,
+        folderId: result
+      });
+    }
+
+    // Jogador recebe a resposta do GM.
+    if (msg.action === "createFolderResult" && msg.toUser === game.user.id) {
+      const pending = this._pending.get(msg.requestId);
+      if (pending) {
+        this._pending.delete(msg.requestId);
+        pending.resolve(msg.folderId);
+      }
+    }
+
+    // GM recebe pedido de exclusão e executa (só se o jogador for o dono).
+    if (msg.action === "deleteFolder" && game.user.isGM) {
+      const firstGM = game.users.find((u) => u.isGM && u.active);
+      if (firstGM?.id !== game.user.id) return;
+
+      let ok = false;
+      try {
+        const folder = game.folders.get(msg.folderId);
+        // Segurança: o jogador só pode excluir as PRÓPRIAS pastas.
+        if (folder && folder.getFlag(MODULE_ID, "userId") === msg.userId) {
+          await folder.delete({ deleteSubfolders: false, deleteContents: false });
+          ok = true;
+        }
+      } catch (e) {
+        console.error(`${MODULE_ID} | falha ao excluir pasta para jogador:`, e);
+      }
+      game.socket.emit(SOCKET, {
+        action: "deleteFolderResult",
+        requestId: msg.requestId,
+        toUser: msg.userId,
+        ok
+      });
+    }
+
+    // Jogador recebe a resposta da exclusão.
+    if (msg.action === "deleteFolderResult" && msg.toUser === game.user.id) {
+      const pending = this._pending.get(msg.requestId);
+      if (pending) {
+        this._pending.delete(msg.requestId);
+        pending.resolve(msg.ok);
+      }
+    }
+  },
+
+  /** True se há ao menos um GM conectado para atender o pedido. */
+  hasActiveGM() {
+    return game.users.some((u) => u.isGM && u.active);
+  },
+
+  /**
+   * Pede ao GM para criar uma pasta. Resolve com o ID da pasta, ou null.
+   * Tem timeout de 10s para não travar caso nenhum GM responda.
+   */
+  requestFolder(name, parentId = null) {
+    return new Promise((resolve) => {
+      const requestId = foundry.utils.randomID();
+      this._pending.set(requestId, { resolve });
+      game.socket.emit(SOCKET, {
+        action: "createFolder",
+        requestId,
+        userId: game.user.id,
+        name,
+        parentId
+      });
+      // Timeout de segurança caso nenhum GM responda.
+      setTimeout(() => {
+        if (this._pending.has(requestId)) {
+          this._pending.delete(requestId);
+          resolve(null);
+        }
+      }, 10000);
+    });
+  },
+
+  /**
+   * Pede ao GM para excluir uma pasta do jogador. Resolve com true/false.
+   * Tem timeout de 10s caso nenhum GM responda.
+   */
+  requestDeleteFolder(folderId) {
+    return new Promise((resolve) => {
+      const requestId = foundry.utils.randomID();
+      this._pending.set(requestId, { resolve });
+      game.socket.emit(SOCKET, {
+        action: "deleteFolder",
+        requestId,
+        userId: game.user.id,
+        folderId
+      });
+      setTimeout(() => {
+        if (this._pending.has(requestId)) {
+          this._pending.delete(requestId);
+          resolve(false);
+        }
+      }, 10000);
+    });
   }
 };
 
@@ -136,18 +341,69 @@ const NotexData = {
   async createFolder(name, parentId = null) {
     const root = await this.userRoot();
     if (!root) return null;
-    return Folder.create({
-      name: name || game.i18n.localize("NOTEX.NewFolderName"),
-      type: "JournalEntry",
-      folder: parentId || root.id,
-      ownership: { default: OWNERSHIP.NONE, [game.user.id]: OWNERSHIP.OWNER },
-      flags: { [MODULE_ID]: { userId: game.user.id } }
-    });
+
+    // GM cria direto (tem permissão).
+    if (game.user.isGM) {
+      return Folder.create({
+        name: name || game.i18n.localize("NOTEX.NewFolderName"),
+        type: "JournalEntry",
+        folder: parentId || root.id,
+        ownership: { default: OWNERSHIP.NONE, [game.user.id]: OWNERSHIP.OWNER },
+        flags: { [MODULE_ID]: { userId: game.user.id } }
+      });
+    }
+
+    // Jogador não pode criar Folder (bloqueio do servidor): pede ao GM.
+    if (!NotexSocket.hasActiveGM()) {
+      ui.notifications.warn(game.i18n.localize("NOTEX.FolderNeedsGM"));
+      return null;
+    }
+    const folderId = await NotexSocket.requestFolder(name, parentId || root.id);
+    if (!folderId) {
+      ui.notifications.warn(game.i18n.localize("NOTEX.FolderNeedsGM"));
+      return null;
+    }
+    return game.folders.get(folderId) ?? null;
   },
 
   /** Primeira página de texto de uma nota (criamos sempre com uma). */
   firstPage(entry) {
     return entry?.pages.find((p) => p.type === "text") ?? entry?.pages.contents[0] ?? null;
+  },
+
+  /** Páginas de uma nota, ordenadas pela ordem manual (sort). */
+  listPages(entry) {
+    if (!entry) return [];
+    return [...entry.pages].sort((a, b) => (a.sort || 0) - (b.sort || 0));
+  },
+
+  /** Resolve a página ativa: a de id informado, ou a primeira. */
+  resolvePage(entry, pageId) {
+    if (!entry) return null;
+    return (pageId && entry.pages.get(pageId)) || this.listPages(entry)[0] || null;
+  },
+
+  /** Cria uma página de texto na nota e retorna a página criada. */
+  async createTextPage(entry, name) {
+    if (!entry) return null;
+    const sort = (this.listPages(entry).at(-1)?.sort ?? 0) + CONST.SORT_INTEGER_DENSITY;
+    const [page] = await entry.createEmbeddedDocuments("JournalEntryPage", [
+      {
+        name: name || game.i18n.localize("NOTEX.NewPageName"),
+        type: "text",
+        text: { content: "", format: 1 },
+        sort
+      }
+    ]);
+    return page ?? null;
+  },
+
+  /** Exclui uma página da nota (mantém ao menos uma). */
+  async deletePage(entry, pageId) {
+    if (!entry) return false;
+    if (this.listPages(entry).length <= 1) return false; // nunca deixa a nota sem página
+    await entry.deleteEmbeddedDocuments("JournalEntryPage", [pageId]);
+    return true;
   },
 
   isPinned(note) {
@@ -188,6 +444,9 @@ class NotexApp extends HandlebarsApplicationMixin(ApplicationV2) {
   /** Id da nota atualmente aberta no editor inline. */
   #activeNoteId = null;
 
+  /** Id da página atualmente aberta dentro da nota ativa. */
+  #activePageId = null;
+
   /** Timer de debounce do auto-save do rascunho. */
   #scratchTimer = null;
 
@@ -199,6 +458,9 @@ class NotexApp extends HandlebarsApplicationMixin(ApplicationV2) {
 
   /** Id da nota que a instância atual do editor está editando. */
   #editorNoteId = null;
+
+  /** Id da página que a instância atual do editor está editando. */
+  #editorPageId = null;
 
   /** Termo de busca atual (filtra notas por título e conteúdo). */
   #searchTerm = "";
@@ -241,10 +503,16 @@ class NotexApp extends HandlebarsApplicationMixin(ApplicationV2) {
       togglePin: NotexApp.#onTogglePin,
       pickColor: NotexApp.#onPickColor,
       selectNote: NotexApp.#onSelectNote,
+      selectSearchResult: NotexApp.#onSelectSearchResult,
       editNote: NotexApp.#onEditNote,
       saveAndView: NotexApp.#onSaveAndView,
       deleteNote: NotexApp.#onDeleteNote,
-      copyLink: NotexApp.#onCopyLink
+      copyLink: NotexApp.#onCopyLink,
+      selectPage: NotexApp.#onSelectPage,
+      createPage: NotexApp.#onCreatePage,
+      deletePage: NotexApp.#onDeletePage,
+      renamePage: NotexApp.#onRenamePage,
+      copyPageLink: NotexApp.#onCopyPageLink
     }
   };
 
@@ -272,15 +540,27 @@ class NotexApp extends HandlebarsApplicationMixin(ApplicationV2) {
     let flat = [];
 
     if (term) {
-      // Busca: lista plana filtrada por título OU conteúdo.
+      // Busca por PÁGINA: retorna cada página (de qualquer nota) cujo nome
+      // OU conteúdo contém o termo. Clicar abre direto naquela página.
       const all = (await NotexData.listNotes()).sort((a, b) => (a.sort || 0) - (b.sort || 0));
-      flat = all
-        .filter((n) => {
-          const inTitle = n.name.toLowerCase().includes(term);
-          const raw = NotexData.firstPage(n)?.text?.content ?? "";
-          return inTitle || NotexApp.#stripHtml(raw).toLowerCase().includes(term);
-        })
-        .map(noteVM);
+      for (const note of all) {
+        for (const page of NotexData.listPages(note)) {
+          const inName = page.name.toLowerCase().includes(term);
+          const body =
+            page.type === "text" ? NotexApp.#stripHtml(page.text?.content ?? "") : "";
+          const inBody = body.toLowerCase().includes(term);
+          if (inName || inBody) {
+            flat.push({
+              noteId: note.id,
+              pageId: page.id,
+              noteName: note.name,
+              pageName: page.name,
+              isImage: page.type === "image",
+              active: note.id === this.#activeNoteId && page.id === this.#activePageId
+            });
+          }
+        }
+      }
     } else {
       // Sem busca: pinadas no topo + árvore de pastas a partir da raiz do usuário.
       const allNotes = await NotexData.listNotes();
@@ -290,9 +570,29 @@ class NotexApp extends HandlebarsApplicationMixin(ApplicationV2) {
       if (root) tree = this.#buildTree(root);
     }
 
+    // Jogador sem pasta provisionada (GM ainda não entrou após instalar).
+    const folderMissing =
+      !this.#searchTerm.trim() && !game.user.isGM && !NotexFolders.findUserFolder();
+
     const activeEntry = this.#activeNoteId ? game.journal.get(this.#activeNoteId) : null;
-    const activePage = NotexData.firstPage(activeEntry);
+
+    // Resolve a página ativa dentro da nota (ou a primeira).
+    if (activeEntry && !activeEntry.pages.get(this.#activePageId)) {
+      this.#activePageId = NotexData.listPages(activeEntry)[0]?.id ?? null;
+    }
+    const activePage = activeEntry ? NotexData.resolvePage(activeEntry, this.#activePageId) : null;
     const rawContent = activePage?.text?.content ?? "";
+
+    // Lista de páginas (índice) da nota ativa.
+    const pages = activeEntry
+      ? NotexData.listPages(activeEntry).map((p) => ({
+          id: p.id,
+          name: p.name,
+          type: p.type,
+          active: p.id === activePage?.id,
+          isImage: p.type === "image"
+        }))
+      : [];
 
     let enriched = "";
     if (activeEntry && !this.#editMode) {
@@ -311,14 +611,19 @@ class NotexApp extends HandlebarsApplicationMixin(ApplicationV2) {
       searchTerm: this.#searchTerm,
       isSearching: !!term,
       noResults: !!term && flat.length === 0,
-      isEmpty: !term && tree.length === 0 && pinned.length === 0,
+      isEmpty: !term && tree.length === 0 && pinned.length === 0 && !folderMissing,
+      folderMissing,
       hasActive: !!activeEntry,
       editMode: this.#editMode,
       activeId: activeEntry?.id ?? "",
       activeName: activeEntry?.name ?? "",
       activeContent: rawContent,
       activeEnriched: enriched,
-      activeUuid: activePage?.uuid ?? ""
+      activeUuid: activePage?.uuid ?? "",
+      pages,
+      activePageName: activePage?.name ?? "",
+      activePageIsImage: activePage?.type === "image",
+      activePageImageSrc: activePage?.type === "image" ? (activePage.src ?? "") : ""
     };
   }
 
@@ -448,11 +753,14 @@ class NotexApp extends HandlebarsApplicationMixin(ApplicationV2) {
       if (entry && titleInput.value.trim() && titleInput.value !== entry.name) {
         await this.#flushActiveEditor();
         const newName = titleInput.value.trim();
-        await entry.update({ name: newName });
-        // Mantém o nome da página em sincronia, para o Journal nativo exibir
-        // o título correto em vez de um placeholder.
-        const page = NotexData.firstPage(entry);
-        if (page && page.name !== newName) await page.update({ name: newName });
+        // { render: false } evita um re-render completo que destruiria o
+        // editor e poderia descartar conteúdo não propagado (race condition).
+        await entry.update({ name: newName }, { render: false });
+        // Atualiza só o nome na lista lateral sem tocar no editor.
+        const nameEl = this.element?.querySelector(
+          `.notex-note-row[data-note-id="${entry.id}"] .notex-note-name`
+        );
+        if (nameEl) nameEl.textContent = newName;
       }
     };
     titleInput.addEventListener("change", commit);
@@ -477,8 +785,11 @@ class NotexApp extends HandlebarsApplicationMixin(ApplicationV2) {
 
     if (!this.#activeNoteId) return;
     const entry = game.journal.get(this.#activeNoteId);
-    const page = NotexData.firstPage(entry);
+    const page = NotexData.resolvePage(entry, this.#activePageId);
     if (!page) return;
+
+    // Página de imagem não usa o editor de texto.
+    if (page.type === "image") return;
 
     // Em modo visualização não montamos o ProseMirror: o conteúdo enriquecido
     // já está renderizado no template. Os links são tratados em #wireContentLinks.
@@ -486,6 +797,7 @@ class NotexApp extends HandlebarsApplicationMixin(ApplicationV2) {
 
     const noteId = this.#activeNoteId;
     this.#editorNoteId = noteId;
+    this.#editorPageId = page.id;
     const initial = page.text?.content ?? "";
 
     // Forma OFICIAL de instanciar o editor. `toggled: false` = editor sempre
@@ -535,6 +847,9 @@ class NotexApp extends HandlebarsApplicationMixin(ApplicationV2) {
         if (note) {
           await this.#flushActiveEditor();
           this.#activeNoteId = note.id;
+          // Se o link aponta para uma PÁGINA específica, abre nela; senão, primeira.
+          this.#activePageId =
+            doc?.documentName === "JournalEntryPage" ? doc.id : null;
           this.#editMode = false;
           this.render();
         } else if (doc) {
@@ -570,7 +885,7 @@ class NotexApp extends HandlebarsApplicationMixin(ApplicationV2) {
     try {
       pm.save?.();
     } catch (e) {
-      console.warn("notex|commitAndRead: pm.save() falhou:", e);
+      console.warn(`${MODULE_ID} | falha ao salvar o editor:`, e);
     }
     return this.#readCommitted(pm);
   }
@@ -579,11 +894,9 @@ class NotexApp extends HandlebarsApplicationMixin(ApplicationV2) {
   async #saveContentFor(noteId, content) {
     if (!noteId) return;
     const entry = game.journal.get(noteId);
-    const page = NotexData.firstPage(entry);
-    if (!page) {
-      console.warn("notex|saveContentFor: página não encontrada para nota", noteId);
-      return;
-    }
+    // Salva na página que o editor estava editando (não sempre a primeira).
+    const page = entry?.pages.get(this.#editorPageId) ?? NotexData.resolvePage(entry, this.#activePageId);
+    if (!page || page.type !== "text") return;
     if (page.text?.content === content) return;
     await page.update({ "text.content": content });
   }
@@ -775,7 +1088,89 @@ class NotexApp extends HandlebarsApplicationMixin(ApplicationV2) {
     if (id === app.#activeNoteId && !app.#editMode) return;
     await app.#flushActiveEditor(); // salva a nota atual ANTES de trocar
     app.#activeNoteId = id;
+    app.#activePageId = null; // nova nota → volta para a primeira página
     app.#editMode = false; // nota existente abre em visualização
+    app.render();
+  }
+
+  /* ---- Páginas ---- */
+
+  /** Abre a nota na página específica clicada no resultado de busca. */
+  static async #onSelectSearchResult(_event, target) {
+    const el = target.closest("[data-note-id][data-page-id]");
+    if (!el) return;
+    const { noteId, pageId } = el.dataset;
+    const app = NotexApp.current;
+    await app.#flushActiveEditor();
+    app.#activeNoteId = noteId;
+    app.#activePageId = pageId;
+    app.#editMode = false;
+    app.render();
+  }
+
+  /** Seleciona uma página dentro da nota ativa. */
+  static async #onSelectPage(_event, target) {
+    const pageId = target.closest("[data-page-id]")?.dataset.pageId;
+    if (!pageId) return;
+    const app = NotexApp.current;
+    if (pageId === app.#activePageId) return;
+    await app.#flushActiveEditor(); // salva a página atual ANTES de trocar
+    app.#activePageId = pageId;
+    app.#editMode = false;
+    app.render();
+  }
+
+  /** Cria uma nova página de texto na nota ativa e a abre em edição. */
+  static async #onCreatePage() {
+    const app = NotexApp.current;
+    const entry = game.journal.get(app.#activeNoteId);
+    if (!entry) return;
+    const name = await NotexApp.#promptName("NOTEX.NewPage", "NOTEX.NewPageName");
+    if (name === null) return;
+    await app.#flushActiveEditor();
+    const page = await NotexData.createTextPage(entry, name);
+    if (page) {
+      app.#activePageId = page.id;
+      app.#editMode = true;
+    }
+    app.render();
+  }
+
+  /** Exclui a página clicada (mantém ao menos uma na nota). */
+  static async #onDeletePage(_event, target) {
+    const pageId = target.closest("[data-page-id]")?.dataset.pageId;
+    const app = NotexApp.current;
+    const entry = game.journal.get(app.#activeNoteId);
+    if (!entry || !pageId) return;
+    const page = entry.pages.get(pageId);
+    if (!page) return;
+
+    const ok = await foundry.applications.api.DialogV2.confirm({
+      window: { title: game.i18n.localize("NOTEX.DeletePage") },
+      content: game.i18n.format("NOTEX.DeletePageConfirm", { name: page.name })
+    });
+    if (!ok) return;
+
+    const deleted = await NotexData.deletePage(entry, pageId);
+    if (!deleted) {
+      ui.notifications.warn(game.i18n.localize("NOTEX.CantDeleteLastPage"));
+      return;
+    }
+    if (app.#activePageId === pageId) app.#activePageId = null; // volta p/ primeira
+    app.render();
+  }
+
+  /** Renomeia a página clicada. */
+  static async #onRenamePage(_event, target) {
+    const pageId = target.closest("[data-page-id]")?.dataset.pageId;
+    const app = NotexApp.current;
+    const entry = game.journal.get(app.#activeNoteId);
+    const page = entry?.pages.get(pageId);
+    if (!page) return;
+    const name = await NotexApp.#promptName("NOTEX.RenamePage", "NOTEX.NewPageName", page.name);
+    if (name === null || !name.trim()) return;
+    await app.#flushActiveEditor();
+    await page.update({ name: name.trim() }, { render: false });
     app.render();
   }
 
@@ -822,6 +1217,7 @@ class NotexApp extends HandlebarsApplicationMixin(ApplicationV2) {
   }
 
   /** Cria uma pasta na raiz do usuário. */
+  /** True se o usuário pode criar pastas; senão avisa e retorna false. */
   static async #onCreateFolder() {
     const name = await NotexApp.#promptName("NOTEX.NewFolder", "NOTEX.NewFolderName");
     if (name === null) return;
@@ -848,8 +1244,25 @@ class NotexApp extends HandlebarsApplicationMixin(ApplicationV2) {
       content: game.i18n.format("NOTEX.DeleteFolderConfirm", { name: folder.name })
     });
     if (!ok) return;
-    // deleteSubfolders/deleteContents = false → conteúdo sobe para a pasta-pai.
-    await folder.delete({ deleteSubfolders: false, deleteContents: false });
+
+    // GM exclui direto (tem permissão).
+    if (game.user.isGM) {
+      // deleteSubfolders/deleteContents = false → conteúdo sobe para a pasta-pai.
+      await folder.delete({ deleteSubfolders: false, deleteContents: false });
+      NotexApp.current?.render();
+      return;
+    }
+
+    // Jogador não pode excluir Folder (bloqueio do servidor): pede ao GM.
+    if (!NotexSocket.hasActiveGM()) {
+      ui.notifications.warn(game.i18n.localize("NOTEX.FolderNeedsGM"));
+      return;
+    }
+    const done = await NotexSocket.requestDeleteFolder(id);
+    if (!done) {
+      ui.notifications.warn(game.i18n.localize("NOTEX.FolderNeedsGM"));
+      return;
+    }
     NotexApp.current?.render();
   }
 
@@ -883,11 +1296,12 @@ class NotexApp extends HandlebarsApplicationMixin(ApplicationV2) {
 
   /* ---- Diálogos auxiliares ---- */
 
-  static async #promptName(titleKey, defaultKey) {
-    const def = game.i18n.localize(defaultKey);
+  static async #promptName(titleKey, defaultKey, presetValue = null) {
+    const def = presetValue ?? game.i18n.localize(defaultKey);
+    const safe = String(def).replace(/"/g, "&quot;");
     return foundry.applications.api.DialogV2.prompt({
       window: { title: game.i18n.localize(titleKey) },
-      content: `<input type="text" name="name" value="${def}" autofocus style="width:100%">`,
+      content: `<input type="text" name="name" value="${safe}" autofocus style="width:100%">`,
       ok: {
         label: game.i18n.localize("NOTEX.Create"),
         callback: (_e, button) => button.form.elements.name.value.trim()
@@ -942,6 +1356,17 @@ class NotexApp extends HandlebarsApplicationMixin(ApplicationV2) {
     const uuid = target.closest("[data-uuid]")?.dataset.uuid;
     if (!uuid) return;
     await game.clipboard.copyPlainText(`@UUID[${uuid}]`);
+    ui.notifications.info(game.i18n.localize("NOTEX.LinkCopied"));
+  }
+
+  /** Copia o link (@UUID) da página clicada no índice. */
+  static async #onCopyPageLink(_event, target) {
+    const pageId = target.closest("[data-page-id]")?.dataset.pageId;
+    const app = NotexApp.current;
+    const entry = game.journal.get(app.#activeNoteId);
+    const page = entry?.pages.get(pageId);
+    if (!page) return;
+    await game.clipboard.copyPlainText(`@UUID[${page.uuid}]`);
     ui.notifications.info(game.i18n.localize("NOTEX.LinkCopied"));
   }
 }
@@ -1115,10 +1540,33 @@ Hooks.once("init", () => {
 });
 
 Hooks.once("ready", async () => {
-  await NotexI18n.apply(); // aplica o idioma do usuário antes de qualquer UI
-  if (game.user.isGM) await NotexFolders.ensureRoot();
+  // O socket é crítico e deve ser registrado ANTES de qualquer await que
+  // possa falhar (como o fetch de idioma), senão o listener nunca cola.
+  NotexSocket.register();
+
+  try {
+    await NotexI18n.apply(); // aplica o idioma do usuário antes da UI
+  } catch (e) {
+    console.warn(`${MODULE_ID} | falha ao aplicar idioma:`, e);
+  }
+
+  if (game.user.isGM) {
+    try {
+      await NotexFolders.provisionAll(); // pasta raiz + subpasta de cada jogador
+    } catch (e) {
+      console.warn(`${MODULE_ID} | falha ao provisionar pastas:`, e);
+    }
+  }
+
   const mod = game.modules.get(MODULE_ID);
   mod.api = { folders: NotexFolders, data: NotexData, i18n: NotexI18n, open: () => NotexApp.open() };
+});
+
+// Quando um usuário novo é criado, o GM cria a pasta dele.
+Hooks.on("createUser", async (user) => {
+  if (game.user.isGM && !user.isGM) {
+    await NotexFolders.ensureUserFolder(user);
+  }
 });
 
 /* -------------------------------------------- */

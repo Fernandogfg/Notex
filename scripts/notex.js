@@ -23,18 +23,92 @@ const NotexFolders = {
     return game.modules.get(MODULE_ID)?.flags?.[MODULE_ID]?.rootFolderName ?? "Notex";
   },
 
+  /** Verifica se o TDS Codex está ativo neste mundo. */
+  get codexActive() {
+    return game.modules.get("tds-codex")?.active ?? false;
+  },
+
+  /** Encontra a pasta raiz do TDS Codex (sem criar). */
+  findCodexRoot() {
+    return game.folders.find(
+      (f) => f.type === "JournalEntry" && f.name === "TDS Codex" && !f.folder
+    ) ?? null;
+  },
+
   async ensureRoot() {
     let root = this.findRoot();
     if (root) return root;
-    if (!game.user.isGM) return null; // só o GM cria a raiz
+    if (!game.user.isGM) return null;
+
+    // Se o TDS Codex está ativo, cria a pasta Notex DENTRO da pasta TDS Codex.
+    if (this.codexActive) {
+      let codexRoot = this.findCodexRoot();
+      if (!codexRoot) {
+        // Cria a pasta TDS Codex se ela ainda não existe.
+        codexRoot = await Folder.create({
+          name: "TDS Codex", type: "JournalEntry", color: "#c9a45c", sorting: "a"
+        });
+      }
+      if (codexRoot) {
+        return Folder.create({
+          name: this.rootName, type: "JournalEntry", color: "#4b2e83",
+          folder: codexRoot.id
+        });
+      }
+    }
+
+    // Sem TDS Codex: cria na raiz (comportamento original).
     return Folder.create({ name: this.rootName, type: "JournalEntry", color: "#4b2e83" });
   },
 
-  /** Encontra a pasta raiz Notex (sem criar). */
+  /** Encontra a pasta raiz Notex (sem criar). Procura dentro do TDS Codex se ativo. */
   findRoot() {
+    const name = this.rootName;
+
+    if (this.codexActive) {
+      const codexRoot = this.findCodexRoot();
+      if (codexRoot) {
+        // Procura a pasta Notex DENTRO do TDS Codex.
+        const inside = game.folders.find(
+          (f) => f.type === "JournalEntry" && f.name === name && f.folder?.id === codexRoot.id
+        );
+        if (inside) return inside;
+      }
+    }
+
+    // Fallback: procura na raiz (compatibilidade com instalações anteriores).
     return game.folders.find(
-      (f) => f.type === "JournalEntry" && f.name === this.rootName && !f.folder
+      (f) => f.type === "JournalEntry" && f.name === name && !f.folder
     ) ?? null;
+  },
+
+  /**
+   * Migra a pasta Notex para dentro do TDS Codex se necessário.
+   * Chamado uma vez no ready pelo GM; move a pasta existente se ela
+   * estiver na raiz mas o TDS Codex estiver ativo.
+   */
+  async migrateToCodex() {
+    if (!game.user.isGM || !this.codexActive) return;
+
+    const codexRoot = this.findCodexRoot();
+    if (!codexRoot) return;
+
+    // Procura a pasta Notex na raiz (fora do TDS Codex).
+    const rootLevel = game.folders.find(
+      (f) => f.type === "JournalEntry" && f.name === this.rootName && !f.folder
+    );
+    if (!rootLevel) return; // já está dentro do TDS Codex, ou não existe
+
+    // Já existe uma dentro do TDS Codex? Não migra (evita duplicar).
+    const alreadyInside = game.folders.find(
+      (f) => f.type === "JournalEntry" && f.name === this.rootName && f.folder?.id === codexRoot.id
+    );
+    if (alreadyInside) return;
+
+    // Move a pasta Notex para dentro do TDS Codex.
+    await rootLevel.update({ folder: codexRoot.id });
+    console.log(`${MODULE_ID} | pasta "${this.rootName}" movida para dentro do TDS Codex`);
+    ui.notifications?.info(`Notex integrado ao TDS Codex.`);
   },
 
   /** Encontra a pasta de um usuário (sem criar). */
@@ -1206,7 +1280,7 @@ class NotexApp extends HandlebarsApplicationMixin(ApplicationV2) {
   /** Cria nota dentro de uma pasta específica (botão na pasta). */
   static async #onCreateNoteHere(_event, target) {
     const app = NotexApp.current;
-    const folderId = target.closest("[data-folder-id]")?.dataset.folderId;
+    const folderId = target.dataset.folderId;
     await app.#flushActiveEditor();
     const note = await NotexData.createNote(null, folderId);
     if (note) {
@@ -1227,7 +1301,7 @@ class NotexApp extends HandlebarsApplicationMixin(ApplicationV2) {
 
   /** Cria uma subpasta dentro de uma pasta. */
   static async #onCreateFolderHere(_event, target) {
-    const parentId = target.closest("[data-folder-id]")?.dataset.folderId;
+    const parentId = target.dataset.folderId;
     const name = await NotexApp.#promptName("NOTEX.NewSubfolder", "NOTEX.NewFolderName");
     if (name === null) return;
     await NotexData.createFolder(name, parentId);
@@ -1236,7 +1310,7 @@ class NotexApp extends HandlebarsApplicationMixin(ApplicationV2) {
 
   /** Exclui uma pasta (e move o conteúdo para a pasta-pai, sem apagar notas). */
   static async #onDeleteFolder(_event, target) {
-    const id = target.closest("[data-folder-id]")?.dataset.folderId;
+    const id = target.dataset.folderId;
     const folder = game.folders.get(id);
     if (!folder) return;
     const ok = await foundry.applications.api.DialogV2.confirm({
@@ -1268,7 +1342,7 @@ class NotexApp extends HandlebarsApplicationMixin(ApplicationV2) {
 
   /** Recolhe/expande uma pasta. */
   static #onToggleFolder(_event, target) {
-    const id = target.closest("[data-folder-id]")?.dataset.folderId;
+    const id = target.dataset.folderId;
     if (!id) return;
     const app = NotexApp.current;
     if (app.#collapsedFolders.has(id)) app.#collapsedFolders.delete(id);
@@ -1483,15 +1557,15 @@ Hooks.once("init", () => {
   const folder = `
 <div class="notex-node notex-folder {{#if collapsed}}collapsed{{/if}}" data-folder-id="{{id}}">
   <div class="notex-folder-row" draggable="true">
-    <a class="notex-folder-toggle" data-action="toggleFolder">
+    <a class="notex-folder-toggle" data-action="toggleFolder" data-folder-id="{{id}}">
       <i class="fas {{#if collapsed}}fa-folder{{else}}fa-folder-open{{/if}}"></i>
     </a>
-    <span class="notex-folder-name" data-action="toggleFolder">{{name}}</span>
-    <a class="notex-folder-add-note" data-action="createNoteHere"
+    <span class="notex-folder-name" data-action="toggleFolder" data-folder-id="{{id}}">{{name}}</span>
+    <a class="notex-folder-add-note" data-action="createNoteHere" data-folder-id="{{id}}"
        data-tooltip="{{localize 'NOTEX.NewNoteHere'}}"><i class="fas fa-file-circle-plus"></i></a>
-    <a class="notex-folder-add" data-action="createFolderHere"
+    <a class="notex-folder-add" data-action="createFolderHere" data-folder-id="{{id}}"
        data-tooltip="{{localize 'NOTEX.NewSubfolder'}}"><i class="fas fa-folder-plus"></i></a>
-    <a class="notex-folder-delete" data-action="deleteFolder"
+    <a class="notex-folder-delete" data-action="deleteFolder" data-folder-id="{{id}}"
        data-tooltip="{{localize 'NOTEX.DeleteFolder'}}"><i class="fas fa-trash"></i></a>
   </div>
   {{#unless collapsed}}
@@ -1552,6 +1626,7 @@ Hooks.once("ready", async () => {
 
   if (game.user.isGM) {
     try {
+      await NotexFolders.migrateToCodex(); // se TDS Codex ativo, move pra dentro dele
       await NotexFolders.provisionAll(); // pasta raiz + subpasta de cada jogador
     } catch (e) {
       console.warn(`${MODULE_ID} | falha ao provisionar pastas:`, e);
